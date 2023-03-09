@@ -1,6 +1,6 @@
 # About
 
-Resize photo files in specified directory at once.
+- 特定のディレクトリ内の JPEG ファイルに対してまとめてリサイズ処理を行う
 
 # Use
 
@@ -19,8 +19,7 @@ go run resize.go *1 *2 *3 *4
 
 - Desktop にある"hoge"フォルダの中にあるファイルを、Desktop にある"resized_hoge"フォルダに書き出す
 - 20MB 以上のファイルは幅が 0.9 倍されて（20MB 未満は幅変更なし）書き出しされる
-
   <br>
-  $ cd hoge/hoge/resize
+  $ cd fuga/fuga/resize
   <br>
   $ go run resize.go ../../../Desktop/hoge ../../../Desktop/resized_hoge 20000000 0.9
