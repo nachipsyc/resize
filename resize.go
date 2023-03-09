@@ -15,25 +15,26 @@ import (
 	"github.com/nfnt/resize"
 )
 
+// 使用する変数を定義
 var source_dir string = ""
 var target_dir string = ""
-var upper_limit int64
+var lower_limit int64
 var magnification float64
 
 func main() {
 	// 入力をパース
 	flag.Parse()
 
-	// 読み込み対象ディレクトリのパスを引数から取得(string)
+	// 読み込み元ディレクトリのパスを引数から取得(string)
 	source_dir = flag.Arg(0)
 
-	// 書き出し対象ディレクトリのパスを引数から取得(string)
+	// 書き出し先ディレクトリのパスを引数から取得(string)
 	target_dir = flag.Arg(1)
 
-	// 画像のファイルサイズの上限を引数から取得(int)
-	upper_limit, _ = strconv.ParseInt(flag.Arg(2),10, 64)
+	// 対象となる画像のファイルサイズの下限を引数から取得(int)
+	lower_limit, _ = strconv.ParseInt(flag.Arg(2),10, 64)
 
-	// リサイズのオプションが指定された場合はセット
+	// リサイズのオプションが指定された場合はセット(float)
 	magnification, _ = strconv.ParseFloat(flag.Arg(3), 64)
 
 	// 対象ディレクトリの中の全ファイルを取得([]os.FileInfo)
@@ -99,7 +100,7 @@ func resizeJpegFiles(jpeg_files []os.FileInfo) {
 		
 		var resized_image image.Image
 		
-		if jpeg_file.Size() >= upper_limit {
+		if jpeg_file.Size() >= lower_limit {
 			// 画像のリサイズ
 			resized_image = resize.Resize(uint(image_width), 0, decoded_image, resize.Lanczos3)
 		}
