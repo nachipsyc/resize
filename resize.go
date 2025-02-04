@@ -56,10 +56,12 @@ func processImage(file os.DirEntry) {
 	sourcePath := filepath.Join(sourceDir, file.Name())
 	targetPath := filepath.Join(targetDir, file.Name())
 
-	// EXIFデータを取得
+	// EXIFデータを取得（なくてもエラーを出さずに処理を続ける）
 	exifData, err := getExifData(sourcePath)
 	if err != nil {
-		log.Printf("EXIF情報の取得に失敗: %v\n", err)
+		log.Printf("EXIF情報なし: %s（通常処理を継続）\n", file.Name())
+	} else {
+		log.Printf("EXIF情報取得成功: %s\n", file.Name())
 	}
 
 	// 画像を開く
@@ -89,32 +91,32 @@ func processImage(file os.DirEntry) {
 	// リサイズ処理
 	resizedImg := resizeImage(img, fileSize)
 
-	// EXIFデータを保持して保存
+	// EXIFデータがある場合は保持、ない場合はそのまま保存
 	saveImageWithExif(resizedImg, targetPath, exifData)
 }
 
-// **EXIFデータを取得**
+// **EXIFデータを取得（エラーでも処理を続ける）**
 func getExifData(filePath string) ([]byte, error) {
 	parser := jpegstructure.NewJpegMediaParser()
 	intfc, err := parser.ParseFile(filePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("EXIF情報なし")
 	}
 
 	sl := intfc.(*jpegstructure.SegmentList)
 	segments := sl.Segments()
 
-	// EXIFセグメントを探して、そのデータをそのまま返す
+	// EXIFセグメントを探して、そのデータを返す
 	for _, segment := range segments {
 		if segment.MarkerId == jpegstructure.MARKER_APP1 {
 			return segment.Data, nil
 		}
 	}
 
-	return nil, fmt.Errorf("EXIF data not found")
+	return nil, fmt.Errorf("EXIFデータなし")
 }
 
-// **EXIFデータを保持してJPEGを保存**
+// **EXIFデータを保持してJPEGを保存（EXIFがない場合はそのまま保存）**
 func saveImageWithExif(img image.Image, targetPath string, exifData []byte) {
 	// メモリ上にJPEGをエンコード
 	buf := new(bytes.Buffer)
@@ -125,7 +127,23 @@ func saveImageWithExif(img image.Image, targetPath string, exifData []byte) {
 		return
 	}
 
-	// **新しいJPEGデータにEXIFを埋め込む**
+	// **EXIFデータがない場合はそのまま書き込み**
+	if exifData == nil {
+		outFile, err := os.Create(targetPath)
+		if err != nil {
+			log.Printf("保存エラー: %v\n", err)
+			return
+		}
+		defer outFile.Close()
+
+		_, err = io.Copy(outFile, buf)
+		if err != nil {
+			log.Printf("JPEG書き込みエラー: %v\n", err)
+		}
+		return
+	}
+
+	// **EXIFデータを埋め込む**
 	parser := jpegstructure.NewJpegMediaParser()
 	intfc, err := parser.ParseBytes(buf.Bytes())
 	if err != nil {
@@ -140,7 +158,7 @@ func saveImageWithExif(img image.Image, targetPath string, exifData []byte) {
 		MarkerId: jpegstructure.MARKER_APP1,
 		Data:     append([]byte("Exif\x00\x00"), exifData...),
 	}
-	sl.Add(segment) // セグメントを追加
+	sl.Add(segment)
 
 	outFile, err := os.Create(targetPath)
 	if err != nil {
