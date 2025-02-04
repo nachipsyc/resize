@@ -1,165 +1,209 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"image"
 	"image/jpeg"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 
+	jpegstructure "github.com/dsoprea/go-jpeg-image-structure/v2"
 	"github.com/nfnt/resize"
 )
 
-// 使用する変数を定義
-var source_dir string = ""
-var target_dir string = ""
-var lower_limit int64
+var sourceDir, targetDir string
+var lowerLimit int64
 var magnification float64
 
 func main() {
-	// 入力をパース
 	flag.Parse()
-
-	// 読み込み元ディレクトリのパスを引数から取得(string)
-	source_dir = flag.Arg(0)
-
-	// 書き出し先ディレクトリのパスを引数から取得(string)
-	target_dir = flag.Arg(1)
-
-	// 対象となる画像のファイルサイズの下限を引数から取得(int)
-	lower_limit, _ = strconv.ParseInt(flag.Arg(2), 10, 64)
-
-	// リサイズのオプションが指定された場合はセット(float)
+	sourceDir = flag.Arg(0)
+	targetDir = flag.Arg(1)
+	lowerLimit, _ = strconv.ParseInt(flag.Arg(2), 10, 64)
 	magnification, _ = strconv.ParseFloat(flag.Arg(3), 64)
 
-	// 対象ディレクトリの中の全ファイルを取得([]os.FileInfo)
-	files, err := getFiles(source_dir)
-
-	// エラーがある場合は出力
+	files, err := os.ReadDir(sourceDir)
 	if err != nil {
 		log.Fatal(err)
-		panic(err)
 	}
 
-	// 取得したファイルからJPEGファイルのみを抽出([]os.FileInfo)
-	jpeg_files := extractJpegFiles(files)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4) // 並列処理の最大数を制限
 
-	// 画像を書き出し(サイズが指定した値以上のものはリサイズ処理を行う)
-	resizeJpegFiles(jpeg_files)
-
-	// encodeImages()として割り出し
-}
-
-// used by main()
-func getFiles(source_dir string) ([]os.FileInfo, error) {
-	// 対象ディレクトリの中のファイル全てを取得、格納
-	files, err := ioutil.ReadDir(source_dir)
-
-	// エラーがあれば"err"を返す
-	if err != nil {
-		return nil, err
-	}
-
-	return files, nil
-}
-
-// used by main()
-func extractJpegFiles(files []os.FileInfo) []os.FileInfo {
-	var jpeg_images []os.FileInfo
 	for _, file := range files {
-		switch filepath.Ext(file.Name()) {
-		case ".jpeg", ".jpg", ".JPG":
-			jpeg_images = append(jpeg_images, file)
-		default:
+		if isJpeg(file.Name()) {
+			wg.Add(1)
+			go func(file os.DirEntry) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				processImage(file)
+			}(file)
 		}
 	}
 
-	return jpeg_images
+	wg.Wait()
+	fmt.Println("すべての画像処理が完了しました。")
 }
 
-// used by main()
-func resizeJpegFiles(jpeg_files []os.FileInfo) {
+func processImage(file os.DirEntry) {
+	sourcePath := filepath.Join(sourceDir, file.Name())
+	targetPath := filepath.Join(targetDir, file.Name())
 
-	for _, jpeg_file := range jpeg_files {
-
-		var resized_image image.Image
-
-		// 指定したサイズよりも大きかった場合
-		if jpeg_file.Size() >= lower_limit {
-
-			// リザイズ対象画像の情報をプリント
-			fmt.Print(jpeg_file.Name())
-			fmt.Println(jpeg_file.Size())
-
-			// ファイルを画像として読み込み
-			decoded_image, _ := decodeImage(jpeg_file)
-
-			// 画像の横幅を取得
-			image_width := float64(decoded_image.Bounds().Dx())
-
-			// リサイズの倍率が指定されていたら幅を変更
-			if magnification != 0 {
-				image_width *= float64(magnification)
-			}
-
-			// 画像のリサイズ
-			resized_image = resize.Resize(uint(image_width), 0, decoded_image, resize.Lanczos3)
-		}
-
-		if resized_image != nil {
-			// リサイズした画像を書き込み
-			encodeImage(resized_image, jpeg_file.Name())
-		}
-		// else if (decoded_image != nil) {
-		// 	// デコードした画像を書き込み
-		// 	encodeImage(decoded_image, jpeg_file.Name())
-		// }
+	// EXIFデータを取得
+	exifData, err := getExifData(sourcePath)
+	if err != nil {
+		log.Printf("EXIF情報の取得に失敗: %v\n", err)
 	}
 
-	fmt.Println("resize completed!!")
+	// 画像を開く
+	imgFile, err := os.Open(sourcePath)
+	if err != nil {
+		log.Printf("画像の読み込みエラー: %v\n", err)
+		return
+	}
+	defer imgFile.Close()
+
+	// 画像をデコード
+	img, _, err := image.Decode(imgFile)
+	if err != nil {
+		log.Printf("画像のデコードエラー: %v\n", err)
+		return
+	}
+
+	// ファイルサイズチェック
+	fileInfo, _ := imgFile.Stat()
+	fileSize := fileInfo.Size()
+	if fileSize < lowerLimit {
+		// lowerLimit 未満ならそのままコピー
+		copyFile(sourcePath, targetPath)
+		return
+	}
+
+	// リサイズ処理
+	resizedImg := resizeImage(img, fileSize)
+
+	// EXIFデータを保持して保存
+	saveImageWithExif(resizedImg, targetPath, exifData)
 }
 
-// used by resizeJpegFiles()
-func decodeImage(jpeg_file os.FileInfo) (image.Image, error) {
-	io_file, err := conversionToReader(jpeg_file)
+// **EXIFデータを取得**
+func getExifData(filePath string) ([]byte, error) {
+	parser := jpegstructure.NewJpegMediaParser()
+	intfc, err := parser.ParseFile(filePath)
 	if err != nil {
 		return nil, err
 	}
 
-	decoded_image, _, err := image.Decode(io_file)
-	if err != nil {
-		return nil, err
+	sl := intfc.(*jpegstructure.SegmentList)
+	segments := sl.Segments()
+
+	// EXIFセグメントを探して、そのデータをそのまま返す
+	for _, segment := range segments {
+		if segment.MarkerId == jpegstructure.MARKER_APP1 {
+			return segment.Data, nil
+		}
 	}
-	return decoded_image, nil
+
+	return nil, fmt.Errorf("EXIF data not found")
 }
 
-// used by resizeJpegFiles()
-func encodeImage(resized_image image.Image, file_name string) error {
-	output, err := os.Create(target_dir + "/" + file_name)
+// **EXIFデータを保持してJPEGを保存**
+func saveImageWithExif(img image.Image, targetPath string, exifData []byte) {
+	// メモリ上にJPEGをエンコード
+	buf := new(bytes.Buffer)
+	options := &jpeg.Options{Quality: 100}
+	err := jpeg.Encode(buf, img, options)
 	if err != nil {
-		return err
+		log.Printf("JPEGエンコードエラー: %v\n", err)
+		return
 	}
 
-	defer output.Close()
-
-	opts := &jpeg.Options{Quality: 100}
-	if err := jpeg.Encode(output, resized_image, opts); err != nil {
-		return err
+	// **新しいJPEGデータにEXIFを埋め込む**
+	parser := jpegstructure.NewJpegMediaParser()
+	intfc, err := parser.ParseBytes(buf.Bytes())
+	if err != nil {
+		log.Printf("JPEGパースエラー: %v\n", err)
+		return
 	}
 
-	return nil
+	sl := intfc.(*jpegstructure.SegmentList)
+
+	// APP1セグメントとしてEXIFを追加
+	segment := &jpegstructure.Segment{
+		MarkerId: jpegstructure.MARKER_APP1,
+		Data:     append([]byte("Exif\x00\x00"), exifData...),
+	}
+	sl.Add(segment) // セグメントを追加
+
+	outFile, err := os.Create(targetPath)
+	if err != nil {
+		log.Printf("保存エラー: %v\n", err)
+		return
+	}
+	defer outFile.Close()
+
+	err = sl.Write(outFile)
+	if err != nil {
+		log.Printf("JPEGの書き込みエラー: %v\n", err)
+	}
 }
 
-// used by decodeImage()
-func conversionToReader(jpeg_file os.FileInfo) (io.Reader, error) {
-	io_file, err := os.Open(source_dir + "/" + jpeg_file.Name())
-	if err != nil {
-		return nil, err
+// **画像のリサイズ**
+func resizeImage(img image.Image, fileSize int64) image.Image {
+	if magnification != 0 {
+		newWidth := uint(float64(img.Bounds().Dx()) * magnification)
+		return resize.Resize(newWidth, 0, img, resize.Lanczos3)
 	}
-	return io_file, nil
+
+	// 90%ずつ縮小しながら lowerLimit 以下になるまでループ
+	resizedImg := img
+	scale := 0.9
+	for fileSize >= lowerLimit {
+		newWidth := uint(float64(resizedImg.Bounds().Dx()) * scale)
+		resizedImg = resize.Resize(newWidth, 0, resizedImg, resize.Lanczos3)
+		fileSize = estimateJPEGSize(resizedImg)
+	}
+	return resizedImg
+}
+
+// **画像のコピー**
+func copyFile(src, dst string) {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		log.Printf("コピー元のファイルを開けません: %v\n", err)
+		return
+	}
+	defer sourceFile.Close()
+
+	targetFile, err := os.Create(dst)
+	if err != nil {
+		log.Printf("コピー先のファイルを作成できません: %v\n", err)
+		return
+	}
+	defer targetFile.Close()
+
+	_, err = io.Copy(targetFile, sourceFile)
+	if err != nil {
+		log.Printf("ファイルのコピーに失敗: %v\n", err)
+	}
+}
+
+// **JPEGファイルかどうかを判定**
+func isJpeg(filename string) bool {
+	ext := filepath.Ext(filename)
+	return ext == ".jpg" || ext == ".jpeg" || ext == ".JPG" || ext == ".JPEG"
+}
+
+// **圧縮後のJPEGサイズを推定**
+func estimateJPEGSize(img image.Image) int64 {
+	width := img.Bounds().Dx()
+	height := img.Bounds().Dy()
+	return int64(width * height * 3 / 10) // 10:1の圧縮を仮定
 }
