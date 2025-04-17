@@ -10,47 +10,90 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 
 	jpegstructure "github.com/dsoprea/go-jpeg-image-structure/v2"
 	"github.com/nfnt/resize"
 )
 
-var sourceDir, targetDir string
-var lowerLimit int64
+var (
+	sourceDir  string
+	targetDir  string
+	lowerLimit int64
+)
 
 func main() {
-	flag.Parse()
-	sourceDir = flag.Arg(0)
-	targetDir = flag.Arg(1)
-	lowerLimit, _ = strconv.ParseInt(flag.Arg(2), 10, 64)
+	flag.StringVar(&sourceDir, "source", "", "ソースディレクトリのパス")
+	flag.StringVar(&targetDir, "target", "", "ターゲットディレクトリのパス")
+	flag.Int64Var(&lowerLimit, "lower", 0, "ファイルサイズの下限")
 
+	// 入力をパース
+	flag.Parse()
+
+	// 引数の検証
+	if sourceDir == "" || targetDir == "" {
+		fmt.Println("Command Error: ソースディレクトリとターゲットディレクトリの両方を指定してください。")
+		fmt.Println("使い方:")
+		fmt.Println("  -source <path>  : ソース画像ディレクトリのパス")
+		fmt.Println("  -target <path>  : ターゲット画像ディレクトリのパス")
+		fmt.Println("  -lower <size>   : ファイルサイズの下限")
+		return
+	}
+
+	// ソースディレクトリを読み込む
 	files, err := os.ReadDir(sourceDir)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 4) // 並列処理の最大数を制限
+	// JPEG画像の数をカウント
+	jpegCount := 0
+	for _, file := range files {
+		if isJpeg(file.Name()) {
+			jpegCount++
+		}
+	}
 
+	// 進捗カウンター用の変数
+	processedCount := 0
+	var countMutex sync.Mutex
+
+	// ログのフォーマットを設定
+	log.SetFlags(log.LstdFlags) // 日時を表示
+
+	// 並列処理のためのWaitGroupとセマフォを初期化
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+
+	// ファイルを処理
 	for _, file := range files {
 		if isJpeg(file.Name()) {
 			wg.Add(1)
 			go func(file os.DirEntry) {
 				defer wg.Done()
 				sem <- struct{}{}
-				defer func() { <-sem }()
-				processImage(file)
+
+				// 処理開始時にカウンターを更新
+				countMutex.Lock()
+				processedCount++
+				currentCount := processedCount // ローカルにコピー
+				countMutex.Unlock()
+
+				// ログメッセージに進捗を含める形に修正
+				processImageWithProgress(file, currentCount, jpegCount)
+
+				<-sem
 			}(file)
 		}
 	}
 
 	wg.Wait()
-	fmt.Println("すべての画像処理が完了しました。")
+	fmt.Println("\nすべての画像処理が完了しました。")
 }
 
+// **画像の処理**
 func processImage(file os.DirEntry) {
+	// 入力元と出力先のパスを設定
 	sourcePath := filepath.Join(sourceDir, file.Name())
 	targetPath := filepath.Join(targetDir, file.Name())
 
@@ -101,6 +144,7 @@ func getExifData(filePath string) ([]byte, error) {
 		return nil, fmt.Errorf("EXIF情報なし")
 	}
 
+	// セグメントリストを取得
 	sl := intfc.(*jpegstructure.SegmentList)
 	segments := sl.Segments()
 
@@ -149,6 +193,7 @@ func saveImageWithExif(img image.Image, targetPath string, exifData []byte, qual
 		return
 	}
 
+	// セグメントリストを取得
 	sl := intfc.(*jpegstructure.SegmentList)
 
 	// APP1セグメントとしてEXIFを追加
@@ -158,6 +203,7 @@ func saveImageWithExif(img image.Image, targetPath string, exifData []byte, qual
 	}
 	sl.Add(segment)
 
+	// 出力ファイルを作成
 	outFile, err := os.Create(targetPath)
 	if err != nil {
 		log.Printf("保存エラー: %v\n", err)
@@ -165,6 +211,7 @@ func saveImageWithExif(img image.Image, targetPath string, exifData []byte, qual
 	}
 	defer outFile.Close()
 
+	// セグメントリストを書き込む
 	err = sl.Write(outFile)
 	if err != nil {
 		log.Printf("JPEGの書き込みエラー: %v\n", err)
@@ -216,6 +263,7 @@ func resizeImage(img image.Image) (image.Image, int) {
 			}
 		}
 
+		// 限界に達した場合
 		if scale < 0.05 || quality < 15 {
 			break
 		}
@@ -348,4 +396,48 @@ func ResizeImage(srcPath string, dstPath string, maxSize int64) error {
 				float64(maxSize)/1024/1024, float64(currentSize)/1024/1024)
 		}
 	}
+}
+
+// processImageWithProgress は進捗状況付きで画像を処理
+func processImageWithProgress(file os.DirEntry, currentCount, totalCount int) {
+	sourcePath := filepath.Join(sourceDir, file.Name())
+	targetPath := filepath.Join(targetDir, file.Name())
+
+	// EXIFデータを取得（なくてもエラーを出さずに処理を続ける）
+	exifData, err := getExifData(sourcePath)
+	if err != nil {
+		log.Printf("EXIF情報なし: %s（通常処理を継続） (%d/%d)\n", file.Name(), currentCount, totalCount)
+	} else {
+		log.Printf("EXIF情報取得成功: %s (%d/%d)\n", file.Name(), currentCount, totalCount)
+	}
+
+	// 画像を開く
+	imgFile, err := os.Open(sourcePath)
+	if err != nil {
+		log.Printf("画像の読み込みエラー: %v\n", err)
+		return
+	}
+	defer imgFile.Close()
+
+	// 画像をデコード
+	img, _, err := image.Decode(imgFile)
+	if err != nil {
+		log.Printf("画像のデコードエラー: %v\n", err)
+		return
+	}
+
+	// ファイルサイズチェック
+	fileInfo, _ := imgFile.Stat()
+	fileSize := fileInfo.Size()
+	if fileSize < lowerLimit {
+		// lowerLimit 未満ならそのままコピー
+		copyFile(sourcePath, targetPath)
+		return
+	}
+
+	// リサイズ処理
+	resizedImg, quality := resizeImage(img)
+
+	// EXIFデータがある場合は保持、ない場合はそのまま保存
+	saveImageWithExif(resizedImg, targetPath, exifData, quality)
 }
