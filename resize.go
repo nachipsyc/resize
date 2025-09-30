@@ -25,7 +25,7 @@ var (
 func main() {
 	flag.StringVar(&sourceDir, "source", "", "ソースディレクトリのパス")
 	flag.StringVar(&targetDir, "target", "", "ターゲットディレクトリのパス")
-	flag.Int64Var(&lowerLimit, "lower", 0, "ファイルサイズの下限")
+	flag.Int64Var(&lowerLimit, "lower", 10000000, "ファイルサイズの下限")
 
 	// 入力をパース
 	flag.Parse()
