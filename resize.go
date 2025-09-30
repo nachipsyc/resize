@@ -224,7 +224,7 @@ func resizeImage(img image.Image) (image.Image, int) {
 	bounds := img.Bounds()
 	width := bounds.Max.X
 	scale := 1.0
-	quality := 95
+	quality := 100
 
 	for {
 		// リサイズ
