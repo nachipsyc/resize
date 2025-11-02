@@ -88,52 +88,7 @@ func main() {
 	}
 
 	wg.Wait()
-	fmt.Println("\nすべての画像処理が完了しました。")
-}
-
-// **画像の処理**
-func processImage(file os.DirEntry) {
-	// 入力元と出力先のパスを設定
-	sourcePath := filepath.Join(sourceDir, file.Name())
-	targetPath := filepath.Join(targetDir, file.Name())
-
-	// EXIFデータを取得（なくてもエラーを出さずに処理を続ける）
-	exifData, err := getExifData(sourcePath)
-	if err != nil {
-		log.Printf("EXIF情報なし: %s（通常処理を継続）\n", file.Name())
-	} else {
-		log.Printf("EXIF情報取得成功: %s\n", file.Name())
-	}
-
-	// 画像を開く
-	imgFile, err := os.Open(sourcePath)
-	if err != nil {
-		log.Printf("画像の読み込みエラー: %v\n", err)
-		return
-	}
-	defer imgFile.Close()
-
-	// 画像をデコード
-	img, _, err := image.Decode(imgFile)
-	if err != nil {
-		log.Printf("画像のデコードエラー: %v\n", err)
-		return
-	}
-
-	// ファイルサイズチェック
-	fileInfo, _ := imgFile.Stat()
-	fileSize := fileInfo.Size()
-	if fileSize < lowerLimit {
-		// lowerLimit 未満ならそのままコピー
-		copyFile(sourcePath, targetPath)
-		return
-	}
-
-	// リサイズ処理
-	resizedImg, quality := resizeImage(img)
-
-	// EXIFデータがある場合は保持、ない場合はそのまま保存
-	saveImageWithExif(resizedImg, targetPath, exifData, quality)
+	fmt.Printf("Completed. %d images resized\n", jpegCount)
 }
 
 // **EXIFデータを取得（エラーでも処理を続ける）**
@@ -408,7 +363,7 @@ func processImageWithProgress(file os.DirEntry, currentCount, totalCount int) {
 	if err != nil {
 		log.Printf("EXIF情報なし: %s（通常処理を継続） (%d/%d)\n", file.Name(), currentCount, totalCount)
 	} else {
-		log.Printf("EXIF情報取得成功: %s (%d/%d)\n", file.Name(), currentCount, totalCount)
+		log.Printf("EXIF取得成功: %s (%d/%d)\n", file.Name(), currentCount, totalCount)
 	}
 
 	// 画像を開く
