@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sync"
 
-	jpegstructure "github.com/dsoprea/go-jpeg-image-structure/v2"
 	"github.com/nfnt/resize"
 )
 
@@ -91,74 +90,104 @@ func main() {
 	fmt.Printf("Completed. %d images resized\n", jpegCount)
 }
 
-// **EXIFデータを取得（エラーでも処理を続ける）**
-func getExifData(filePath string) ([]byte, error) {
-	parser := jpegstructure.NewJpegMediaParser()
-	intfc, err := parser.ParseFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("EXIF情報なし")
+// **元JPEGからAPP0〜APP15(メタデータ)セグメントをすべて抜き出す**
+// EXIF(APP1), IPTC(APP13), XMP, ICC などをまとめて保持するための処理
+func extractAppSegments(src []byte) []byte {
+	// JPEG SOI チェック
+	if len(src) < 4 || src[0] != 0xFF || src[1] != 0xD8 {
+		return nil
 	}
 
-	// セグメントリストを取得
-	sl := intfc.(*jpegstructure.SegmentList)
-	segments := sl.Segments()
+	buf := new(bytes.Buffer)
+	i := 2 // SOI(FFD8)の直後から走査
 
-	// EXIFセグメントを探して、そのデータを返す
-	for _, segment := range segments {
-		if segment.MarkerId == jpegstructure.MARKER_APP1 {
-			return segment.Data, nil
+	for {
+		if i+4 > len(src) {
+			break
 		}
+		if src[i] != 0xFF {
+			// マーカーではない → ヘッダ部終了とみなす
+			break
+		}
+
+		marker := src[i+1]
+
+		// スキャン開始(SOS)に達したら終了
+		if marker == 0xDA {
+			break
+		}
+
+		// RST系やTEM以外は長さ付きセグメント
+		if marker == 0xD8 || marker == 0xD9 {
+			// SOI/EOI は2バイトだけ
+			i += 2
+			continue
+		}
+
+		if i+4 > len(src) {
+			break
+		}
+		segLen := int(src[i+2])<<8 | int(src[i+3])
+		segEnd := i + 2 + segLen
+		if segEnd > len(src) {
+			break
+		}
+
+		// APP0〜APP15 をそのまま退避
+		if marker >= 0xE0 && marker <= 0xEF {
+			buf.Write(src[i:segEnd])
+		}
+
+		i = segEnd
 	}
 
-	return nil, fmt.Errorf("EXIFデータなし")
+	return buf.Bytes()
 }
 
-// **EXIFデータを保持してJPEGを保存（EXIFがない場合はそのまま保存）**
-func saveImageWithExif(img image.Image, targetPath string, exifData []byte, quality int) {
-	// メモリ上にJPEGをエンコード
-	buf := new(bytes.Buffer)
+// **元画像のメタデータ(APPセグメント群)をすべて保持したままJPEGエンコード**
+func encodeJpegWithMetadata(img image.Image, srcPath string, quality int) (*bytes.Buffer, error) {
+	// まず通常のJPEGとしてエンコード
+	encoded := new(bytes.Buffer)
 	options := &jpeg.Options{Quality: quality}
-	err := jpeg.Encode(buf, img, options)
+	if err := jpeg.Encode(encoded, img, options); err != nil {
+		return nil, fmt.Errorf("JPEGエンコードエラー: %w", err)
+	}
+
+	// 元ファイルを読み込んでメタデータ(APPセグメント)を抽出
+	origBytes, err := os.ReadFile(srcPath)
 	if err != nil {
-		log.Printf("JPEGエンコードエラー: %v\n", err)
-		return
+		// 元が読めなければそのまま返す
+		return encoded, nil
+	}
+	appSegs := extractAppSegments(origBytes)
+	if len(appSegs) == 0 {
+		// メタデータなし → そのまま返す
+		return encoded, nil
 	}
 
-	// **EXIFデータがない場合はそのまま書き込み**
-	if exifData == nil {
-		outFile, err := os.Create(targetPath)
-		if err != nil {
-			log.Printf("保存エラー: %v\n", err)
-			return
-		}
-		defer outFile.Close()
-
-		_, err = io.Copy(outFile, buf)
-		if err != nil {
-			log.Printf("JPEG書き込みエラー: %v\n", err)
-		}
-		return
+	// 新しいJPEGの先頭(SOI)直後にAPPセグメント群を差し込む
+	encBytes := encoded.Bytes()
+	if len(encBytes) < 2 || encBytes[0] != 0xFF || encBytes[1] != 0xD8 {
+		// 想定外だが、一応そのまま返す
+		return encoded, nil
 	}
 
-	// **EXIFデータを埋め込む**
-	parser := jpegstructure.NewJpegMediaParser()
-	intfc, err := parser.ParseBytes(buf.Bytes())
+	out := new(bytes.Buffer)
+	out.Write(encBytes[:2]) // SOI
+	out.Write(appSegs)      // 元のメタデータ
+	out.Write(encBytes[2:]) // 以降は新しくエンコードされたヘッダ＋画像データ
+
+	return out, nil
+}
+
+// **メタデータ(EXIF, IPTC, TIFF など)を保持してJPEGを保存**
+func saveImageWithMetadata(img image.Image, srcPath, targetPath string, quality int) {
+	buf, err := encodeJpegWithMetadata(img, srcPath, quality)
 	if err != nil {
-		log.Printf("JPEGパースエラー: %v\n", err)
+		log.Printf("%v\n", err)
 		return
 	}
 
-	// セグメントリストを取得
-	sl := intfc.(*jpegstructure.SegmentList)
-
-	// APP1セグメントとしてEXIFを追加
-	segment := &jpegstructure.Segment{
-		MarkerId: jpegstructure.MARKER_APP1,
-		Data:     append([]byte("Exif\x00\x00"), exifData...),
-	}
-	sl.Add(segment)
-
-	// 出力ファイルを作成
 	outFile, err := os.Create(targetPath)
 	if err != nil {
 		log.Printf("保存エラー: %v\n", err)
@@ -166,10 +195,8 @@ func saveImageWithExif(img image.Image, targetPath string, exifData []byte, qual
 	}
 	defer outFile.Close()
 
-	// セグメントリストを書き込む
-	err = sl.Write(outFile)
-	if err != nil {
-		log.Printf("JPEGの書き込みエラー: %v\n", err)
+	if _, err := io.Copy(outFile, buf); err != nil {
+		log.Printf("JPEG書き込みエラー: %v\n", err)
 	}
 }
 
@@ -283,46 +310,33 @@ func ResizeImage(srcPath string, dstPath string, maxSize int64) error {
 		newHeight := int(float64(height) * scale)
 		resized := resize.Resize(uint(newWidth), uint(newHeight), img, resize.Lanczos3)
 
-		// 一時ファイルを作成
-		tempFile, err := os.CreateTemp(os.TempDir(), "resize_*.jpg")
+		// 元画像のメタデータ(APPセグメント)をすべて保持したままJPEGをメモリ上にエンコード
+		buf, err := encodeJpegWithMetadata(resized, srcPath, quality)
 		if err != nil {
-			return fmt.Errorf("一時ファイルの作成に失敗: %v", err)
-		}
-		tempPath := tempFile.Name()
-
-		// JPEGとして保存
-		err = jpeg.Encode(tempFile, resized, &jpeg.Options{Quality: quality})
-		tempFile.Close()
-
-		if err != nil {
-			os.Remove(tempPath)
 			return fmt.Errorf("画像の保存に失敗: %v", err)
 		}
 
 		// サイズを確認
-		fileInfo, err := os.Stat(tempPath)
-		if err != nil {
-			os.Remove(tempPath)
-			return fmt.Errorf("ファイルサイズの取得に失敗: %v", err)
-		}
-
-		currentSize := fileInfo.Size()
+		currentSize := int64(buf.Len())
 		sizeRatio := float64(currentSize) / float64(maxSize)
 
 		log.Printf("試行: scale=%.2f, quality=%d, size=%.2fMB (目標: %.2fMB, 比率: %.1f)",
 			scale, quality, float64(currentSize)/1024/1024, float64(maxSize)/1024/1024, sizeRatio)
 
 		if currentSize <= maxSize {
-			// 目標達成
-			err = os.Rename(tempPath, dstPath)
+			// 目標達成 → 出力ファイルとして保存
+			outFile, err := os.Create(dstPath)
 			if err != nil {
-				os.Remove(tempPath)
-				return fmt.Errorf("ファイルの移動に失敗: %v", err)
+				return fmt.Errorf("ファイルの作成に失敗: %v", err)
 			}
+			defer outFile.Close()
+
+			if _, err := io.Copy(outFile, buf); err != nil {
+				return fmt.Errorf("ファイルの書き込みに失敗: %v", err)
+			}
+
 			return nil
 		}
-
-		os.Remove(tempPath)
 
 		// サイズに応じて圧縮強度を調整
 		if sizeRatio > 5.0 {
@@ -358,14 +372,6 @@ func processImageWithProgress(file os.DirEntry, currentCount, totalCount int) {
 	sourcePath := filepath.Join(sourceDir, file.Name())
 	targetPath := filepath.Join(targetDir, file.Name())
 
-	// EXIFデータを取得（なくてもエラーを出さずに処理を続ける）
-	exifData, err := getExifData(sourcePath)
-	if err != nil {
-		log.Printf("EXIF情報なし: %s（通常処理を継続） (%d/%d)\n", file.Name(), currentCount, totalCount)
-	} else {
-		log.Printf("EXIF取得成功: %s (%d/%d)\n", file.Name(), currentCount, totalCount)
-	}
-
 	// 画像を開く
 	imgFile, err := os.Open(sourcePath)
 	if err != nil {
@@ -382,7 +388,11 @@ func processImageWithProgress(file os.DirEntry, currentCount, totalCount int) {
 	}
 
 	// ファイルサイズチェック
-	fileInfo, _ := imgFile.Stat()
+	fileInfo, err := imgFile.Stat()
+	if err != nil {
+		log.Printf("ファイル情報取得エラー: %v\n", err)
+		return
+	}
 	fileSize := fileInfo.Size()
 	if fileSize < lowerLimit {
 		// lowerLimit 未満ならそのままコピー
@@ -393,6 +403,9 @@ func processImageWithProgress(file os.DirEntry, currentCount, totalCount int) {
 	// リサイズ処理
 	resizedImg, quality := resizeImage(img)
 
-	// EXIFデータがある場合は保持、ない場合はそのまま保存
-	saveImageWithExif(resizedImg, targetPath, exifData, quality)
+	// 進捗をログに出力（currentCount / totalCount）
+	log.Printf("Resizing %s (%d/%d)\n", file.Name(), currentCount, totalCount)
+
+	// EXIF / IPTC / TIFF など、元JPEGのAPPセグメントをすべて保持して保存
+	saveImageWithMetadata(resizedImg, sourcePath, targetPath, quality)
 }
